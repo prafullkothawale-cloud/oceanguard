@@ -315,7 +315,7 @@ with tab2:
         key="live",
         video_processor_factory=LiveProcessor,
         rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
-        media_stream_constraints={"video": {"facingMode": "environment"}, "audio": False},
+        media_stream_constraints={"video": {"width": {"ideal": 640}, "height": {"ideal": 480}}, "audio": False},
         async_processing=True,
     )
     if ctx.video_processor:
