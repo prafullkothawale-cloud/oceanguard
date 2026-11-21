@@ -1,3 +1,4 @@
+import requests
 import json
 import random
 import sqlite3
@@ -101,8 +102,26 @@ def exif_gps(img):
     except Exception:
         return None
 
+# ---------- database (Supabase online storage, SQLite fallback) ----------
+COLS = ["id", "ts", "lat", "lon", "source", "plastic", "animals", "details"]
 
-# ---------- database ----------
+
+def cloud_on():
+    try:
+        return "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets
+    except Exception:
+        return False
+
+
+def _hdr():
+    k = st.secrets["SUPABASE_KEY"]
+    return {"apikey": k, "Authorization": f"Bearer {k}", "Content-Type": "application/json"}
+
+
+def _url():
+    return st.secrets["SUPABASE_URL"].rstrip("/") + "/rest/v1/detections"
+
+
 def db():
     con = sqlite3.connect(DB_PATH)
     con.execute(
@@ -113,18 +132,40 @@ def db():
     return con
 
 
-def save_row(lat, lon, source, counts):
-    plastic, animals = split_counts(counts)
+def insert_rows(rows):
+    """rows: list of dicts with ts, lat, lon, source, plastic, animals, details."""
+    if cloud_on():
+        r = requests.post(_url(), headers={**_hdr(), "Prefer": "return=minimal"}, json=rows, timeout=20)
+        r.raise_for_status()
+        return
     con = db()
-    con.execute(
+    con.executemany(
         "INSERT INTO detections (ts, lat, lon, source, plastic, animals, details) VALUES (?,?,?,?,?,?,?)",
-        (datetime.now().isoformat(timespec="seconds"), lat, lon, source, plastic, animals, json.dumps(counts)),
+        [(x["ts"], x["lat"], x["lon"], x["source"], x["plastic"], x["animals"], x["details"]) for x in rows],
     )
     con.commit()
     con.close()
 
 
+def save_row(lat, lon, source, counts):
+    plastic, animals = split_counts(counts)
+    insert_rows([{
+        "ts": datetime.now().isoformat(timespec="seconds"), "lat": float(lat), "lon": float(lon),
+        "source": source, "plastic": int(plastic), "animals": int(animals), "details": json.dumps(counts),
+    }])
+
+
 def load_rows():
+    if cloud_on():
+        try:
+            r = requests.get(_url(), headers=_hdr(),
+                             params={"select": "*", "order": "id.asc", "limit": 1000}, timeout=20)
+            r.raise_for_status()
+            df = pd.DataFrame(r.json())
+            return df[COLS] if not df.empty else pd.DataFrame(columns=COLS)
+        except Exception as e:
+            st.error(f"Could not read online storage: {e}")
+            return pd.DataFrame(columns=COLS)
     con = db()
     df = pd.read_sql_query("SELECT * FROM detections", con)
     con.close()
@@ -134,52 +175,97 @@ def load_rows():
 def add_demo_data():
     random.seed(7)
     centers = [(18.95, 72.80, 12), (19.10, 72.75, 6), (18.80, 72.90, 4)]
-    con = db()
+    rows = []
     for clat, clon, n in centers:
         for _ in range(n):
-            plastic = max(0, int(random.gauss(8 if n > 8 else 4, 3)))
-            animals = random.choice([0, 0, 1, 2, 3])
-            con.execute(
-                "INSERT INTO detections (ts, lat, lon, source, plastic, animals, details) VALUES (?,?,?,?,?,?,?)",
-                (datetime.now().isoformat(timespec="seconds"),
-                 clat + random.uniform(-0.06, 0.06), clon + random.uniform(-0.06, 0.06),
-                 "demo", plastic, animals, "{}"),
-            )
+            rows.append({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "lat": clat + random.uniform(-0.06, 0.06), "lon": clon + random.uniform(-0.06, 0.06),
+                "source": "demo", "plastic": max(0, int(random.gauss(8 if n > 8 else 4, 3))),
+                "animals": random.choice([0, 0, 1, 2, 3]), "details": "{}",
+            })
+    insert_rows(rows)
+
+
+def _delete(sql_where, params, rest_query):
+    if cloud_on():
+        r = requests.delete(_url() + rest_query, headers=_hdr(), timeout=20)
+        r.raise_for_status()
+        return
+    con = db()
+    con.execute("DELETE FROM detections" + sql_where, params)
     con.commit()
     con.close()
 
 
 def clear_demo_data():
-    con = db()
-    con.execute("DELETE FROM detections WHERE source='demo'")
-    con.commit()
-    con.close()
+    _delete(" WHERE source='demo'", (), "?source=eq.demo")
+
 
 def clear_all_data():
-    con = db()
-    con.execute("DELETE FROM detections")
-    con.commit()
-    con.close()
+    _delete("", (), "?id=gt.0")
+
 
 def delete_record(rec_id):
-    con = db()
-    con.execute("DELETE FROM detections WHERE id = ?", (rec_id,))
-    con.commit()
-    con.close()    
+    _delete(" WHERE id = ?", (int(rec_id),), f"?id=eq.{int(rec_id)}")
 
 
-def base_map(lat, lon, zoom=10):
-    m = folium.Map(location=[lat, lon], zoom_start=zoom, tiles="OpenStreetMap")
-    folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri", name="Satellite",
-    ).add_to(m)
+ESRI_IMG = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+ESRI_LABELS = "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"
+
+
+def base_map(lat, lon, zoom=9):
+    m = folium.Map(location=[lat, lon], zoom_start=zoom, tiles=None)
+    folium.TileLayer("OpenStreetMap", name="Street map", show=False).add_to(m)
+    folium.TileLayer(tiles=ESRI_IMG, attr="Esri", name="Satellite", show=True).add_to(m)
+    folium.TileLayer(tiles=ESRI_LABELS, attr="Esri", name="Place names", overlay=True, show=True).add_to(m)
     return m
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_currents(lats, lons, hours):
+    """Hourly ocean current (speed km/h, direction the current is heading towards) from Open-Meteo."""
+    try:
+        r = requests.get(
+            "https://marine-api.open-meteo.com/v1/marine",
+            params={
+                "latitude": ",".join(f"{x:.4f}" for x in lats),
+                "longitude": ",".join(f"{x:.4f}" for x in lons),
+                "hourly": "ocean_current_velocity,ocean_current_direction",
+                "forecast_hours": hours,
+                "cell_selection": "sea",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict):
+            data = [data]
+        out = []
+        for d in data:
+            h = d.get("hourly", {})
+            out.append((h.get("ocean_current_velocity", []), h.get("ocean_current_direction", [])))
+        return out
+    except Exception:
+        return None
+
+
+def drift_path(lat, lon, speeds, dirs):
+    """Move a point hour by hour. speeds in km/h, dirs in degrees (direction of travel, 0 = north)."""
+    path = [(lat, lon)]
+    for s, d in zip(speeds, dirs):
+        if s is None or d is None:
+            continue
+        lat += s * np.cos(np.radians(d)) / 111.0
+        lon += s * np.sin(np.radians(d)) / (111.0 * max(0.2, np.cos(np.radians(lat))))
+        path.append((lat, lon))
+    return path
 
 
 # ---------- sidebar ----------
 st.sidebar.markdown("## 🌊 OceanGuard")
 st.sidebar.caption("Detect plastic. Protect marine life.")
+st.sidebar.caption("☁️ Online storage connected" if cloud_on() else "💾 Local storage (not permanent online)")
 conf = st.sidebar.slider("Confidence threshold", 0.10, 0.90, 0.40, 0.05)
 only_plastic = st.sidebar.checkbox("Show only plastic / debris", value=False)
 st.sidebar.markdown("---")
@@ -404,7 +490,49 @@ with tab4:
             folium.Circle([r.glat, r.glon], radius=cell * 111000 / 2, color=colors[r.level], fill=True,
                           fill_opacity=0.45, tooltip=f"{r.level}: score {r.score}, {int(r.plastic)} plastic").add_to(m)
         folium.LayerControl().add_to(m)
+        st.markdown("##### Drift forecast")
+        mode = st.radio("Current data", ["Real forecast (Open-Meteo)", "Manual"], horizontal=True)
+        hours = st.slider("Hours ahead", 6, 72, 24)
+        cand = g[g.level != "Low"].head(8).reset_index(drop=True)
+        drift_rows = []
+        if len(cand) == 0:
+            st.info("No Medium or High hotspots to forecast yet.")
+        elif mode.startswith("Real"):
+            series = fetch_currents(tuple(float(x) for x in cand.glat), tuple(float(x) for x in cand.glon), hours)
+            if not series or not any(len(sp) for sp, _ in series):
+                st.warning("Could not get current data right now. Try again later or switch to Manual.")
+            else:
+                for (_, r), (sp, di) in zip(cand.iterrows(), series):
+                    vals = [s for s in sp if s is not None]
+                    drift_rows.append((r, drift_path(r.glat, r.glon, sp, di), sum(vals) / len(vals) if vals else 0))
+        else:
+            c1, c2 = st.columns(2)
+            bearing = c1.slider("Current direction (degrees, 0 = north, 90 = east)", 0, 359, 90)
+            speed = c2.slider("Current speed (km/h)", 0.0, 5.0, 1.0, 0.1)
+            for _, r in cand.iterrows():
+                drift_rows.append((r, drift_path(r.glat, r.glon, [speed] * hours, [bearing] * hours), speed))
+
+        table = []
+        for r, path, avg in drift_rows:
+            if len(path) < 2:
+                continue
+            folium.PolyLine(path, color="#8e44ad", weight=3, dash_array="6", tooltip=f"Drift path ({hours} h)").add_to(m)
+            end = path[-1]
+            folium.Circle(end, radius=cell * 111000 / 2, color="#8e44ad", fill=True, fill_opacity=0.25,
+                          tooltip=f"Expected position in {hours} h (score {r.score})").add_to(m)
+            km = float(np.hypot((end[0] - path[0][0]) * 111.0,
+                                (end[1] - path[0][1]) * 111.0 * np.cos(np.radians(path[0][0]))))
+            table.append({"from lat": round(r.glat, 3), "from lon": round(r.glon, 3),
+                          "to lat": round(end[0], 3), "to lon": round(end[1], 3),
+                          "drift (km)": round(km, 1), "avg current (km/h)": round(avg, 2)})
+        if drift_rows and not table:
+            st.info("No current data for these cells (they may be too close to land). Try Manual.")
         st_folium(m, height=480, use_container_width=True)
+        if table:
+            st.dataframe(pd.DataFrame(table), hide_index=True, width="stretch")
+        st.caption("Current data: Open-Meteo Marine API (Copernicus Marine, about 8 km resolution), CC BY 4.0. "
+                   "Floating plastic is also pushed by wind and waves, which this estimate ignores, and "
+                   "accuracy near the coast is limited.")
 
         st.markdown("##### Cleanup priority list")
         out = g.rename(columns={"glat": "lat", "glon": "lon"})
@@ -413,3 +541,4 @@ with tab4:
         st.caption("Priority score = plastic count x 1.5 if marine life is also present.")
 
 st.markdown('<p class="small">OceanGuard | YOLO11n model, 9 classes | SY AI&DS PBL project</p>', unsafe_allow_html=True)
+
